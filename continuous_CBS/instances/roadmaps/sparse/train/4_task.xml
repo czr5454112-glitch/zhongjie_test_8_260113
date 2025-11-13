@@ -1,0 +1,23 @@
+<?xml version="1.0" ?>
+<root>
+   <agent start_id="169" goal_id="35"/>
+   <agent start_id="76" goal_id="3"/>
+   <agent start_id="158" goal_id="66"/>
+   <agent start_id="119" goal_id="60"/>
+   <agent start_id="153" goal_id="19"/>
+   <agent start_id="139" goal_id="5"/>
+   <agent start_id="4" goal_id="39"/>
+   <agent start_id="57" goal_id="93"/>
+   <agent start_id="56" goal_id="92"/>
+   <agent start_id="118" goal_id="154"/>
+   <agent start_id="36" goal_id="9"/>
+   <agent start_id="125" goal_id="160"/>
+   <agent start_id="151" goal_id="17"/>
+   <agent start_id="47" goal_id="82"/>
+   <agent start_id="7" goal_id="42"/>
+   <agent start_id="136" goal_id="130"/>
+   <agent start_id="120" goal_id="156"/>
+   <agent start_id="53" goal_id="88"/>
+   <agent start_id="78" goal_id="115"/>
+   <agent start_id="23" goal_id="101"/>
+</root>
