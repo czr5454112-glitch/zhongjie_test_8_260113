@@ -264,18 +264,52 @@ class CCBSEnv(gym.Env):
 
 # 定义回调类
 class RewardCallback(BaseCallback):
-    def __init__(self, max_episodes, *args, **kwargs):
+    def __init__(self, max_episodes, convergence_window=100, convergence_threshold=0.01, *args, **kwargs):
         super(RewardCallback, self).__init__(*args, **kwargs)
         self.rewards = []
         self.max_episodes = max_episodes
         self.episode_count = 0
+        self.convergence_window = convergence_window  # 用于检测收敛的窗口大小
+        self.convergence_threshold = convergence_threshold  # 收敛阈值（奖励变化率）
+        self.best_reward = float('-inf')
+        self.converged = False
+        self.last_checkpoint_episode = 0
+        self.checkpoint_interval = 50  # 每50个episode保存一次检查点
 
     def _on_step(self) -> bool:
         # 每步记录一次奖励
         if self.locals['dones'].any():
-            self.rewards.append(self.locals['rewards'])
+            reward = float(self.locals['rewards'])
+            self.rewards.append(reward)
             self.episode_count += 1
-            print(f"已完成 {self.episode_count} 个回合")
+            
+            # 更新最佳奖励
+            if reward > self.best_reward:
+                self.best_reward = reward
+            
+            # 检测收敛
+            if len(self.rewards) >= self.convergence_window:
+                recent_rewards = self.rewards[-self.convergence_window:]
+                reward_std = np.std(recent_rewards)
+                reward_mean = np.mean(recent_rewards)
+                
+                # 如果最近窗口内的奖励标准差很小，认为收敛
+                if reward_std < abs(reward_mean) * self.convergence_threshold:
+                    if not self.converged:
+                        self.converged = True
+                        print(f"[收敛检测] Episode {self.episode_count}: 检测到收敛! "
+                              f"最近{self.convergence_window}个episode的平均奖励={reward_mean:.4f}, "
+                              f"标准差={reward_std:.4f}")
+                else:
+                    self.converged = False
+            
+            # 定期打印信息
+            if self.episode_count % 10 == 0:
+                avg_reward = np.mean(self.rewards[-10:]) if len(self.rewards) >= 10 else np.mean(self.rewards)
+                print(f"Episode {self.episode_count}/{self.max_episodes}: "
+                      f"最近平均奖励={avg_reward:.4f}, 最佳奖励={self.best_reward:.4f}, "
+                      f"收敛状态={'已收敛' if self.converged else '训练中'}")
+        
         if self.episode_count >= self.max_episodes:
             print(f"已完成 {self.max_episodes} 个回合，停止训练")
             return False  # 停止训练

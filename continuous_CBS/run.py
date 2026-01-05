@@ -28,7 +28,7 @@ from Animation import GraphRender
 # ============================================================================
 
 # -------------------- 运行模式配置 --------------------
-RUN_MODE = "solve"  # 可选: "train", "solve", "evaluate", "batch_test"
+RUN_MODE = "evaluate"  # 可选: "train", "solve", "evaluate", "batch_test"
 
 # -------------------- CCBS 算法配置 --------------------
 CCBS_CONFIG = {
@@ -633,12 +633,20 @@ def evaluate_model():
     print(f"总任务数: {len(results)}")
     print(f"成功求解: {found_count} ({found_count/len(results)*100:.1f}%)")
     if found_count > 0:
-        avg_flowtime = sum(r["flowtime"] for r in results if r["found"]) / found_count
-        avg_makespan = sum(r["makespan"] for r in results if r["found"]) / found_count
-        avg_time = sum(r["elapsed_time"] for r in results if r["found"]) / found_count
-        print(f"平均 flowtime: {avg_flowtime:.2f}")
-        print(f"平均 makespan: {avg_makespan:.2f}")
-        print(f"平均求解时间: {avg_time:.2f}秒")
+        # 过滤掉None值再计算平均值
+        flowtimes = [r["flowtime"] for r in results if r["found"] and r["flowtime"] is not None]
+        makespans = [r["makespan"] for r in results if r["found"] and r["makespan"] is not None]
+        elapsed_times = [r["elapsed_time"] for r in results if r["found"]]
+        
+        if flowtimes:
+            avg_flowtime = sum(flowtimes) / len(flowtimes)
+            print(f"平均 flowtime: {avg_flowtime:.2f}")
+        if makespans:
+            avg_makespan = sum(makespans) / len(makespans)
+            print(f"平均 makespan: {avg_makespan:.2f}")
+        if elapsed_times:
+            avg_time = sum(elapsed_times) / len(elapsed_times)
+            print(f"平均求解时间: {avg_time:.2f}秒")
     
     # 保存结果
     if BATCH_TEST_CONFIG["save_results"]:

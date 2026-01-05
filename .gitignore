@@ -1,35 +1,35 @@
-.gitignore content:
-__MACOSX/
-ccbs_zhongjie/
-# 允许训练好的模型zip文件
-!continuous_CBS/ppo_*.zip
-*.zip
-*.tar
-*.tar.gz
-*.tgz
-*.rar
-*.7z
-*.bak
-*.tmp
-*.log
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
 env/
 venv/
-.venv/
-build/
-dist/
+ENV/
 *.egg-info/
-.pytest_cache/
+dist/
+build/
+
+# 检查点文件（可选，如果需要包含则删除此行）
+checkpoints/
+
+# 大型日志文件（可选）
+*.log
+training_console.log
+training_log_*.txt
+
+# IDE
 .vscode/
 .idea/
-Thumbs.db
+*.swp
+*.swo
+
+# OS
 .DS_Store
+Thumbs.db
 
-
-
-
-
+# 临时文件
+*.tmp
+*.bak
+*~
