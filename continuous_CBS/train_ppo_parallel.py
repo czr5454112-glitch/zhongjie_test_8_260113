@@ -72,7 +72,7 @@ PPO_CONFIG = {
     "batch_size": 1024,  # 批大小
     "n_epochs": 10,  # 每批优化轮数
     "max_episodes": 80000,  # 最大训练回合数
-    "total_timesteps": int(6e6),  # 总训练步数（会被max_episodes限制）
+    "total_timesteps": int(1e6),  # 总训练步数（100万步）
     "checkpoint_freq": 200000,  # 检查点保存频率（步数）
 }
 
@@ -216,7 +216,14 @@ def create_single_env(map_path, train_task_dir, env_id=0):
         
         # 加载任务
         task = Task()
-        task.load_from_file(task_file)
+        try:
+            task.load_from_file(task_file)
+        except (ValueError, KeyError, AttributeError) as e:
+            raise ValueError(f"任务文件格式错误: {os.path.basename(task_file)} - {str(e)}")
+        
+        # 验证任务有效性
+        if not task.agents or len(task.agents) == 0:
+            raise ValueError(f"任务文件无有效智能体: {os.path.basename(task_file)}")
         
         if CCBS_CONFIG["use_precalculated_heuristic"]:
             ccbs.map.init_heuristic(task.agents)
@@ -270,17 +277,26 @@ def create_env_for_map(map_path, train_task_dir, env_id=0):
         env_id: 环境ID
     """
     def _init():
-        # 创建环境，如果失败则重试（最多10次）
-        max_retries = 10
+        # 创建环境，如果失败则重试（最多20次，增加重试次数以跳过有问题的任务）
+        max_retries = 20
+        last_error = None
         for retry in range(max_retries):
-            env = create_single_env(map_path, train_task_dir, env_id)
-            if env is not None:
-                return env
-            if retry < max_retries - 1:
-                print(f"[环境 {env_id}] 重试创建环境 ({retry+1}/{max_retries})...")
+            try:
+                env = create_single_env(map_path, train_task_dir, env_id)
+                if env is not None:
+                    return env
+            except Exception as e:
+                last_error = str(e)
+                # 如果是任务文件格式错误，继续重试（会随机选择其他任务）
+                if "任务文件格式错误" in str(e) or "invalid literal" in str(e):
+                    if retry < max_retries - 1:
+                        continue
+                # 其他错误也重试
+                if retry < max_retries - 1:
+                    continue
         
         # 如果所有重试都失败，抛出异常
-        raise RuntimeError(f"环境 {env_id} 创建失败，已重试 {max_retries} 次")
+        raise RuntimeError(f"环境 {env_id} 创建失败，已重试 {max_retries} 次。最后错误: {last_error}")
     
     return _init
 
@@ -296,51 +312,78 @@ class VecEnvRewardCallback(RewardCallback):
     def _on_step(self) -> bool:
         # VecEnv兼容的episode统计
         # 从infos中获取每个环境的episode信息（需要VecMonitor）
-        if 'infos' in self.locals:
-            infos = self.locals['infos']
-            dones = self.locals.get('dones', [])
-            
-            # 统计本step中done的环境数量
-            num_dones = int(np.sum(dones)) if isinstance(dones, np.ndarray) else sum(dones)
-            
-            # 从每个done的环境的infos中提取episode reward
-            for i, (info, done) in enumerate(zip(infos, dones)):
-                if done and isinstance(info, dict):
-                    # VecMonitor会在infos中添加episode信息
-                    episode_info = info.get('episode', {})
-                    if episode_info:
-                        episode_reward = episode_info.get('r', None)
-                        episode_length = episode_info.get('l', None)
+        try:
+            if 'infos' in self.locals:
+                infos = self.locals.get('infos', [])
+                dones = self.locals.get('dones', [])
+                
+                # 确保infos和dones是列表/数组
+                if not isinstance(infos, (list, np.ndarray)):
+                    infos = []
+                if not isinstance(dones, (list, np.ndarray)):
+                    dones = []
+                
+                # 统计本step中done的环境数量
+                num_dones = int(np.sum(dones)) if isinstance(dones, np.ndarray) else sum(dones) if dones else 0
+                
+                # 从每个done的环境的infos中提取episode reward
+                for i in range(min(len(infos), len(dones))):
+                    try:
+                        info = infos[i] if i < len(infos) else {}
+                        done = dones[i] if i < len(dones) else False
                         
-                        if episode_reward is not None:
-                            self.rewards.append(float(episode_reward))
-                            self.episode_count += 1
+                        if done and isinstance(info, dict):
+                            # VecMonitor会在infos中添加episode信息
+                            # 注意：episode信息可能不存在，需要安全获取
+                            episode_info = info.get('episode', None)
+                            if episode_info is None:
+                                # 如果episode信息不存在，尝试从info中直接获取
+                                # 某些情况下VecMonitor可能将episode信息直接放在info中
+                                if 'r' in info and 'l' in info:
+                                    episode_info = {'r': info['r'], 'l': info['l']}
                             
-                            # 更新最佳奖励
-                            if episode_reward > self.best_reward:
-                                self.best_reward = episode_reward
-                            
-                            # 检测收敛
-                            if len(self.rewards) >= self.convergence_window:
-                                recent_rewards = self.rewards[-self.convergence_window:]
-                                reward_std = np.std(recent_rewards)
-                                reward_mean = np.mean(recent_rewards)
+                            if episode_info and isinstance(episode_info, dict):
+                                episode_reward = episode_info.get('r', None)
+                                episode_length = episode_info.get('l', None)
                                 
-                                if reward_std < abs(reward_mean) * self.convergence_threshold:
-                                    if not self.converged:
-                                        self.converged = True
-                                        print(f"[收敛检测] Episode {self.episode_count}: 检测到收敛! "
-                                              f"最近{self.convergence_window}个episode的平均奖励={reward_mean:.4f}, "
-                                              f"标准差={reward_std:.4f}")
-                                else:
-                                    self.converged = False
-                            
-                            # 定期打印信息
-                            if self.episode_count % 10 == 0:
-                                avg_reward = np.mean(self.rewards[-10:]) if len(self.rewards) >= 10 else np.mean(self.rewards)
-                                print(f"Episode {self.episode_count}/{self.max_episodes}: "
-                                      f"最近平均奖励={avg_reward:.4f}, 最佳奖励={self.best_reward:.4f}, "
-                                      f"收敛状态={'已收敛' if self.converged else '训练中'}")
+                                if episode_reward is not None:
+                                    self.rewards.append(float(episode_reward))
+                                    self.episode_count += 1
+                                    
+                                    # 更新最佳奖励
+                                    if episode_reward > self.best_reward:
+                                        self.best_reward = episode_reward
+                                    
+                                    # 检测收敛
+                                    if len(self.rewards) >= self.convergence_window:
+                                        recent_rewards = self.rewards[-self.convergence_window:]
+                                        reward_std = np.std(recent_rewards)
+                                        reward_mean = np.mean(recent_rewards)
+                                        
+                                        if reward_std < abs(reward_mean) * self.convergence_threshold:
+                                            if not self.converged:
+                                                self.converged = True
+                                                print(f"[收敛检测] Episode {self.episode_count}: 检测到收敛! "
+                                                      f"最近{self.convergence_window}个episode的平均奖励={reward_mean:.4f}, "
+                                                      f"标准差={reward_std:.4f}")
+                                        else:
+                                            self.converged = False
+                                    
+                                    # 定期打印信息
+                                    if self.episode_count % 10 == 0:
+                                        avg_reward = np.mean(self.rewards[-10:]) if len(self.rewards) >= 10 else np.mean(self.rewards)
+                                        print(f"Episode {self.episode_count}/{self.max_episodes}: "
+                                              f"最近平均奖励={avg_reward:.4f}, 最佳奖励={self.best_reward:.4f}, "
+                                              f"收敛状态={'已收敛' if self.converged else '训练中'}")
+                    except (KeyError, IndexError, TypeError, AttributeError) as e:
+                        # 忽略单个环境的错误，继续处理其他环境
+                        continue
+        except Exception as e:
+            # 如果发生任何错误，记录但不中断训练
+            # 只在第一次遇到错误时打印，避免日志过多
+            if not hasattr(self, '_error_logged'):
+                print(f"[警告] VecEnvRewardCallback处理episode信息时出错: {e}，将跳过此步骤")
+                self._error_logged = True
         
         # 检查最大回合数限制
         if self.episode_count >= self.max_episodes:
@@ -447,7 +490,10 @@ def create_parallel_envs():
         env = SubprocVecEnv(env_constructors, start_method='spawn')
     
     # 使用VecMonitor包装环境，以便正确统计episode信息
-    env = VecMonitor(env, filename=None, info_keywords=('episode',))
+    # 保存monitor.csv以便后续分析（可选，如果不需要可以设为None）
+    monitor_file = os.path.join(SCRIPT_DIR, "logs", "monitor.csv")
+    os.makedirs(os.path.dirname(monitor_file), exist_ok=True)
+    env = VecMonitor(env, filename=monitor_file, info_keywords=('episode',))
     
     return env
 
@@ -483,6 +529,10 @@ def train_parallel():
     
     # 创建PPO模型
     print("\n[步骤3] 创建PPO模型...")
+    # 确保TensorBoard日志目录存在
+    tensorboard_log_dir = os.path.join(SCRIPT_DIR, "logs", "tensorboard")
+    os.makedirs(tensorboard_log_dir, exist_ok=True)
+    
     model = PPO(
         "MultiInputPolicy",  # 使用MultiInputPolicy因为观察空间是Dict
         env=env,
@@ -495,10 +545,12 @@ def train_parallel():
         batch_size=PPO_CONFIG["batch_size"],
         n_epochs=PPO_CONFIG["n_epochs"],
         verbose=1,
-        tensorboard_log="./logs/tensorboard/"
+        tensorboard_log=tensorboard_log_dir
     )
     
     print(f"[信息] PPO模型创建成功")
+    print(f"[信息] TensorBoard日志目录: {tensorboard_log_dir}")
+    print(f"[信息] Monitor CSV文件: {os.path.join(SCRIPT_DIR, 'logs', 'monitor.csv')}")
     print(f"  - 学习率: {PPO_CONFIG['learning_rate']}")
     print(f"  - 折扣因子: {PPO_CONFIG['gamma']}")
     print(f"  - 每环境采样步数: {PPO_CONFIG['n_steps']}")
@@ -530,6 +582,12 @@ def train_parallel():
     
     # 开始训练
     print("\n[步骤5] 开始训练...")
+    print("=" * 80)
+    print(f"[提示] 训练日志将同时输出到控制台和TensorBoard")
+    print(f"[提示] 实时监控方法：")
+    print(f"  1. TensorBoard: tensorboard --logdir {tensorboard_log_dir} --host 127.0.0.1 --port 6006")
+    print(f"  2. 日志文件: tail -f logs/train_stdout.log (如果使用tee重定向)")
+    print(f"  3. Monitor CSV: tail -f logs/monitor.csv")
     print("=" * 80)
     
     try:

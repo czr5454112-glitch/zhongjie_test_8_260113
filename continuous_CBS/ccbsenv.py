@@ -72,7 +72,10 @@ class CCBSEnv(gym.Env):
             import os
             from structs import Task, Solution
             
-            max_retries = 10
+            max_retries = 30  # 增加重试次数，以便跳过有问题的任务文件
+            last_error = None
+            tried_files = set()  # 记录已尝试的文件，避免重复选择有问题的文件
+            
             for retry in range(max_retries):
                 try:
                     # 重新扫描任务文件目录（确保每次reset都能获取最新任务列表）
@@ -88,8 +91,15 @@ class CCBSEnv(gym.Env):
                     if len(training_files) == 0:
                         raise ValueError(f"训练任务目录中没有可用的任务文件: {self._train_task_dir}")
                     
+                    # 排除已尝试过的有问题的文件
+                    available_files = [f for f in training_files if f not in tried_files]
+                    if len(available_files) == 0:
+                        # 如果所有文件都试过了，重置记录（可能是新的一轮）
+                        tried_files.clear()
+                        available_files = training_files
+                    
                     # 随机选择一个任务文件
-                    task_file = random.choice(training_files)
+                    task_file = random.choice(available_files)
                     
                     # 重用地图对象（如果已存在）
                     if hasattr(self, '_world_map') and self._world_map is not None:
@@ -118,7 +128,16 @@ class CCBSEnv(gym.Env):
                     
                     # 加载任务
                     task = Task()
-                    task.load_from_file(task_file)
+                    try:
+                        task.load_from_file(task_file)
+                    except (ValueError, KeyError, AttributeError) as e:
+                        # 如果任务文件格式错误，记录并重试
+                        tried_files.add(task_file)
+                        if "invalid literal" in str(e) or "任务文件格式错误" in str(e):
+                            last_error = f"任务文件格式错误: {os.path.basename(task_file)} - {str(e)}"
+                            if retry < max_retries - 1:
+                                continue
+                        raise
                     
                     if self._ccbs_config["use_precalculated_heuristic"]:
                         ccbs.map.init_heuristic(task.agents)
@@ -152,9 +171,15 @@ class CCBSEnv(gym.Env):
                     break
                     
                 except Exception as e:
-                    if retry == max_retries - 1:
-                        raise RuntimeError(f"reset时重新选择任务失败: {e}")
-                    continue
+                    last_error = str(e)
+                    # 如果是任务文件格式错误，记录文件并重试
+                    if "invalid literal" in str(e) or "任务文件格式错误" in str(e):
+                        if task_file:
+                            tried_files.add(task_file)
+                    if retry < max_retries - 1:
+                        continue
+                    # 如果所有重试都失败
+                    raise RuntimeError(f"reset时重新选择任务失败，已重试{max_retries}次。最后错误: {last_error}")
         
         # 重置环境状态
         self.done = False
@@ -368,6 +393,14 @@ class CCBSEnv(gym.Env):
 
         truncated = False
         info = {}
+        
+        # 当 episode 结束时，添加 episode 信息到 info（VecMonitor 需要）
+        if self.done:
+            info['episode'] = {
+                'r': float(self.reward),  # episode 总奖励
+                'l': int(self.current_step),  # episode 长度（步数）
+            }
+        
         print("current step:", self.current_step)
         print("current cardinal:", self.state['cardinal_conflict'])
         print("current semi_cardinal:", self.state['semi_cardinal_conflict'])
@@ -394,10 +427,38 @@ class RewardCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         # 每步记录一次奖励
-        if self.locals['dones'].any():
-            reward = float(self.locals['rewards'])
+        try:
+            # 安全地获取 locals 中的信息
+            dones = self.locals.get('dones', None)
+            if dones is None:
+                return True  # 如果没有 dones 信息，继续训练
+            
+            # 处理单个环境的情况（dones 可能是标量或数组）
+            if hasattr(dones, 'any'):
+                if not dones.any():
+                    return True
+            elif not dones:
+                return True
+            
+            # 获取奖励
+            rewards = self.locals.get('rewards', None)
+            if rewards is None:
+                return True  # 如果没有奖励信息，继续训练
+            
+            # 处理单个环境的情况（rewards 可能是标量或数组）
+            if hasattr(rewards, '__iter__') and not isinstance(rewards, str):
+                # 如果是数组，取最后一个完成的episode的奖励
+                reward = float(rewards[-1]) if len(rewards) > 0 else 0.0
+            else:
+                reward = float(rewards)
+            
             self.rewards.append(reward)
             self.episode_count += 1
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            # 如果获取信息失败，记录错误但继续训练
+            if self.episode_count % 100 == 0:  # 每100个episode才打印一次，避免刷屏
+                print(f"[警告] RewardCallback获取episode信息时出错: {e}，将跳过此步骤")
+            return True
             
             # 更新最佳奖励
             if reward > self.best_reward:

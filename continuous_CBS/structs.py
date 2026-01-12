@@ -235,7 +235,40 @@ class Task:
         agent_id = 0
         for agent_task in root:
             ag_attr = agent_task.attrib
-            self.agents.append(Agent(int(ag_attr['start_id'][1:]), int(ag_attr['goal_id'][1:]), agent_id))
+            
+            # 处理两种格式：
+            # 1. 带'n'前缀: "n216" -> 去掉'n'得到"216"
+            # 2. 直接数字: "136" -> 直接使用
+            start_id_str = ag_attr.get('start_id', '').strip()
+            goal_id_str = ag_attr.get('goal_id', '').strip()
+            
+            if not start_id_str or not goal_id_str:
+                raise ValueError(f"任务文件中agent {agent_id} 的start_id或goal_id为空")
+            
+            # 如果以'n'开头，去掉'n'前缀；否则直接使用
+            try:
+                if start_id_str.startswith('n'):
+                    start_id_str_clean = start_id_str[1:].strip()
+                    if not start_id_str_clean:
+                        raise ValueError(f"任务文件中agent {agent_id} 的start_id格式错误: '{start_id_str}'")
+                    start_id = int(start_id_str_clean)
+                else:
+                    start_id = int(start_id_str)
+            except ValueError as e:
+                raise ValueError(f"任务文件中agent {agent_id} 的start_id格式错误: '{start_id_str}' - {str(e)}")
+            
+            try:
+                if goal_id_str.startswith('n'):
+                    goal_id_str_clean = goal_id_str[1:].strip()
+                    if not goal_id_str_clean:
+                        raise ValueError(f"任务文件中agent {agent_id} 的goal_id格式错误: '{goal_id_str}'")
+                    goal_id = int(goal_id_str_clean)
+                else:
+                    goal_id = int(goal_id_str)
+            except ValueError as e:
+                raise ValueError(f"任务文件中agent {agent_id} 的goal_id格式错误: '{goal_id_str}' - {str(e)}")
+            
+            self.agents.append(Agent(start_id, goal_id, agent_id))
             agent_id += 1
 
     def __repr__(self) -> str:
