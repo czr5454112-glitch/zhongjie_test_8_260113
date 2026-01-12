@@ -37,11 +37,11 @@ class CCBSEnv(gym.Env):
         self.max_step = 1024
         self.reward_1 = 15  # 当前节点满足约束且无其它冲突（从10提高到15）
         self.reward_2 = 2  # 分支数量权重系数
-        self.reward_3 = -5  # 当前节点不满足约束
+        self.reward_3 = -2  # 当前节点不满足约束（从-5改为-2，减少无效路径的累积惩罚）
         self.cardinal_conflicts_weight = 2  # cardinal_conflict权重（从1提高到2）
         self.semicard_conflicts_weight = 1.5  # semicard_conflict权重（从1提高到1.5）
         self.non_cardinal_conflict_weight = 1.2  # non_cardinal冲突数量权重（从1提高到1.2）
-        self.reward_iter_pos = -0.2  # 每次迭代惩罚（从-0.5降低到-0.2）
+        self.reward_iter_pos = -0.05  # 每次迭代惩罚（从-0.2降低到-0.05，避免长episode累积负回报过多）
         self.reward_fail = -100  # episode失败惩罚（未找到解时的惩罚，从-15提高到-100避免失败也能拿高分）
         self.cost_weight = 0.0  # 目标函数权重（暂时关闭，避免反向激励问题）
         self.high_level_generated = 1
@@ -52,6 +52,11 @@ class CCBSEnv(gym.Env):
         self.final_res = None
         # action_space改为[-1,1]，避免硬clip导致梯度语义差
         self.action_space = Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        
+        # 课程学习参数（用于降低难度，让success_rate先>0）
+        self.curriculum_mode = True  # 是否启用课程学习
+        self.curriculum_max_agents = 25  # 当前阶段允许的最大agent数量（初始25，通过set_attr动态更新）
+        self._agent_count_cache = {}  # 缓存任务文件的agent数量，避免重复解析
 
         # 状态空间：定义CBS状态空间（统一使用Box，避免Discrete与np.array不匹配）
         self.observation_space = Dict({
@@ -76,6 +81,8 @@ class CCBSEnv(gym.Env):
             max_retries = 30  # 增加重试次数，以便跳过有问题的任务文件
             last_error = None
             tried_files = set()  # 记录已尝试的文件，避免重复选择有问题的文件
+            task_file = None  # 初始化task_file，避免在except分支中未定义
+            curriculum_skipped = False  # 标记是否是课程学习跳过的episode
             
             for retry in range(max_retries):
                 try:
@@ -98,6 +105,27 @@ class CCBSEnv(gym.Env):
                         # 如果所有文件都试过了，重置记录（可能是新的一轮）
                         tried_files.clear()
                         available_files = training_files
+                    
+                    # 课程学习：根据agent数量过滤任务（降低难度）
+                    # 关键：如果过滤后无可用任务，返回空episode（立即done），而不是报错
+                    # 这样hard map的env在早期会快速done，不会真正训练，也不会干扰训练
+                    curriculum_skipped = False
+                    if self.curriculum_mode and self.curriculum_max_agents > 0:
+                        filtered_files = []
+                        for f in available_files:
+                            # 获取或缓存agent数量
+                            agent_count = self._get_agent_count_from_file(f)
+                            if agent_count is not None and agent_count <= self.curriculum_max_agents:
+                                filtered_files.append(f)
+                        
+                        # 如果过滤后有可用文件，使用过滤后的列表
+                        if len(filtered_files) > 0:
+                            available_files = filtered_files
+                        else:
+                            # 过滤后为空：说明当前课程阶段不允许训练此地图
+                            # 设置标志，返回空episode（立即done）
+                            curriculum_skipped = True
+                            break  # 跳出重试循环，进入空episode处理逻辑
                     
                     # 随机选择一个任务文件
                     task_file = random.choice(available_files)
@@ -182,7 +210,37 @@ class CCBSEnv(gym.Env):
                     # 如果所有重试都失败
                     raise RuntimeError(f"reset时重新选择任务失败，已重试{max_retries}次。最后错误: {last_error}")
         
-        # 重置环境状态
+        # 检查是否是课程学习跳过的episode（当前阶段不允许训练此地图）
+        if curriculum_skipped:
+            # 返回空episode（立即done，reward=0）
+            # 这样hard map的env在早期会快速done，不会真正训练，也不会干扰训练
+            self.done = True
+            self.episode_reward = 0.0
+            self.current_step = 1
+            self.final_res = None
+            
+            # 返回一个有效的初始状态（全零状态，表示"跳过"）
+            self.state = {
+                'cardinal_conflict': np.array([0.0], dtype=np.float32),
+                'semi_cardinal_conflict': np.array([0.0], dtype=np.float32),
+                'non_cardinal_conflict': np.array([0.0], dtype=np.float32),
+                'agents_number': np.array([0.0], dtype=np.float32),
+                'cost': np.array([0.0], dtype=np.float32),
+                'cur_depth': np.array([0.0], dtype=np.float32)
+            }
+            
+            info = {
+                'is_success': False,
+                'done_reason': 0,  # 0表示跳过（不是真正的done原因，但用于区分）
+                'curriculum_skipped': True  # 标记这是课程学习跳过的episode
+            }
+            
+            # 设置标志，以便step()也能识别
+            self.curriculum_skipped = True
+            
+            return self.state, info
+        
+        # 重置环境状态（正常情况）
         self.done = False
         self.episode_reward = 0.0  # 重置episode累计奖励
         self.current_step = 1
@@ -212,6 +270,15 @@ class CCBSEnv(gym.Env):
         return self.state, info
 
     def step(self, action):
+        # 如果这是课程学习跳过的episode（在reset()时已设置done=True），直接返回
+        if self.done and hasattr(self, 'curriculum_skipped') and getattr(self, 'curriculum_skipped', False):
+            info = {
+                'is_success': False,
+                'done_reason': 0,
+                'curriculum_skipped': True
+            }
+            return self.state, 0.0, True, False, info
+        
         # 修复action处理：从[-1,1]线性映射到[0,1]，避免硬clip
         # action通常是np.ndarray(shape=(1,))，在[-1,1]范围内
         if isinstance(action, np.ndarray):
@@ -425,9 +492,16 @@ class CCBSEnv(gym.Env):
         info = {}
         
         # VecMonitor会自动生成episode信息，不需要手动设置
-        # 只添加自定义字段（如成功标志）
+        # 添加自定义字段（成功标志和done_reason统计）
         if self.done:
             info['is_success'] = (self.final_res is not None)
+            # done_reason: 0=running, 1=success, 2=timeout, 3=fail
+            if self.final_res is not None:
+                info['done_reason'] = 1  # success
+            elif truncated:
+                info['done_reason'] = 2  # timeout (max_step截断)
+            else:
+                info['done_reason'] = 3  # fail (树空/无解)
         
         # 移除print以提高性能（20个并行环境会疯狂刷屏）
         # print("current step:", self.current_step)
@@ -439,6 +513,26 @@ class CCBSEnv(gym.Env):
 
         # 返回单步奖励（不是累计奖励）
         return self.state, float(step_reward), self.done, truncated, info
+    
+    def _get_agent_count_from_file(self, task_file):
+        """从任务文件中获取agent数量（带缓存）"""
+        # 检查缓存
+        if task_file in self._agent_count_cache:
+            return self._agent_count_cache[task_file]
+        
+        # 解析XML获取agent数量
+        try:
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(task_file)
+            root = tree.getroot()
+            agents = root.findall('.//agent')
+            agent_count = len(agents)
+            # 缓存结果
+            self._agent_count_cache[task_file] = agent_count
+            return agent_count
+        except Exception as e:
+            # 解析失败，返回None（会在后续重试逻辑中处理）
+            return None
 
 
 # 定义回调类
