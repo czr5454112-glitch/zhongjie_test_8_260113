@@ -34,7 +34,7 @@ class CCBSEnv(gym.Env):
         self.low_level_expanded = low_level_expanded
         self.alg = CCBS(map)
         self.max_process_agent = 100
-        self.max_step = 2048  # 从1024增加到2048，给算法更多时间找到解
+        self.max_step = 4096  # 从2048增加到4096，给算法更多时间找到解
         self.reward_1 = 15  # 当前节点满足约束且无其它冲突（从10提高到15）
         self.reward_2 = 2  # 分支数量权重系数
         self.reward_3 = -2  # 当前节点不满足约束（从-5改为-2，减少无效路径的累积惩罚）
@@ -65,7 +65,7 @@ class CCBSEnv(gym.Env):
             'non_cardinal_conflict': Box(low=0, high=5000, shape=(1,), dtype=np.float32),  # non_cardinal冲突数量
             "agents_number": Box(low=0, high=1000, shape=(1,), dtype=np.float32),  # 涉及冲突的智能体数量
             'cost': Box(low=0, high=1e9, shape=(1,), dtype=np.float32),  # 当前路径总和
-            'cur_depth': Box(low=0, high=2048, shape=(1,), dtype=np.float32)  # 当前搜索树深度
+            'cur_depth': Box(low=0, high=4096, shape=(1,), dtype=np.float32)  # 当前搜索树深度（与max_step同步）
         })
 
     def reset(self, seed=None, **kwargs):

@@ -100,7 +100,7 @@ CCBS_CONFIG = {
 
 # 环境配置（奖励参数已在ccbsenv.py中优化）
 RL_ENV_CONFIG = {
-    "max_step": 2048,  # 从1024增加到2048，给算法更多时间找到解
+    "max_step": 4096,  # 从2048增加到4096，给算法更多时间找到解
     "max_process_agent": 100,
 }
 
@@ -407,6 +407,15 @@ class VecEnvRewardCallback(RewardCallback):
                                         else:
                                             self.converged = False
                                     
+                                    # 收集CCBS统计信息（用于后续汇总显示）
+                                    if isinstance(info, dict) and 'ccbs_stats' in info:
+                                        if not hasattr(self, 'ccbs_stats_list'):
+                                            self.ccbs_stats_list = []
+                                        self.ccbs_stats_list.append(info['ccbs_stats'])
+                                        # 保持列表大小（只保留最近100个episode的统计）
+                                        if len(self.ccbs_stats_list) > 100:
+                                            self.ccbs_stats_list.pop(0)
+                                    
                                     # 定期打印信息（包含done_reason统计和CCBS算法状态）
                                     if self.episode_count % 10 == 0:
                                         avg_reward = np.mean(self.rewards[-10:]) if len(self.rewards) >= 10 else np.mean(self.rewards)
@@ -430,17 +439,25 @@ class VecEnvRewardCallback(RewardCallback):
                                             skip_ratio = skip_count / total_episodes if total_episodes > 0 else 0.0
                                             skip_stats = f", 课程跳过: {skip_count}/{total_episodes} ({skip_ratio*100:.1f}%), 累计跳过: {self.curriculum_skipped_count}"
                                         
-                                        # 统计CCBS算法运行状态（从当前环境的info中获取）
+                                        # 统计CCBS算法运行状态（从收集的统计信息中计算平均值）
                                         ccbs_stats_info = ""
-                                        if isinstance(info, dict) and 'ccbs_stats' in info:
-                                            stats = info['ccbs_stats']
-                                            ccbs_stats_info = (f", CCBS: step={stats.get('step', 0)}, "
-                                                             f"tree_size={stats.get('tree_size', 0)}, "
-                                                             f"conflicts=[card:{stats.get('cardinal_conflicts', 0)}, "
-                                                             f"semi:{stats.get('semi_cardinal_conflicts', 0)}, "
-                                                             f"non:{stats.get('non_cardinal_conflicts', 0)}], "
-                                                             f"searches={stats.get('low_level_searches', 0)}, "
-                                                             f"expanded={stats.get('low_level_expanded', 0)}")
+                                        if hasattr(self, 'ccbs_stats_list') and len(self.ccbs_stats_list) > 0:
+                                            # 计算最近10个episode的CCBS统计平均值
+                                            recent_stats = self.ccbs_stats_list[-10:] if len(self.ccbs_stats_list) >= 10 else self.ccbs_stats_list
+                                            avg_step = np.mean([s.get('step', 0) for s in recent_stats])
+                                            avg_tree_size = np.mean([s.get('tree_size', 0) for s in recent_stats])
+                                            avg_card = np.mean([s.get('cardinal_conflicts', 0) for s in recent_stats])
+                                            avg_semi = np.mean([s.get('semi_cardinal_conflicts', 0) for s in recent_stats])
+                                            avg_non = np.mean([s.get('non_cardinal_conflicts', 0) for s in recent_stats])
+                                            avg_searches = np.mean([s.get('low_level_searches', 0) for s in recent_stats])
+                                            avg_expanded = np.mean([s.get('low_level_expanded', 0) for s in recent_stats])
+                                            success_found = sum([1 for s in recent_stats if s.get('final_res', False)])
+                                            
+                                            ccbs_stats_info = (f", CCBS(最近{len(recent_stats)}个episode平均): "
+                                                             f"step={avg_step:.1f}, tree_size={avg_tree_size:.1f}, "
+                                                             f"conflicts=[card:{avg_card:.1f}, semi:{avg_semi:.1f}, non:{avg_non:.1f}], "
+                                                             f"searches={avg_searches:.1f}, expanded={avg_expanded:.1f}, "
+                                                             f"success={success_found}/{len(recent_stats)}")
                                         
                                         print(f"Episode {self.episode_count}/{self.max_episodes}: "
                                               f"最近平均奖励={avg_reward:.4f}, 最佳奖励={self.best_reward:.4f}, "
