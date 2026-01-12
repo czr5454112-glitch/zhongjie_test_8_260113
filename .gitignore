@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# 模型文件（太大，不上传）
+*.zip
+*.pth
+*.pt
+*.h5
+*.ckpt
+
+# 训练输出
+checkpoints/
+logs/
+tensorboard/
+*.log
+*.csv
+*.txt
+!README.md
+!LICENSE
+test_evaluation_log.txt
+training_console.log
+training_log_*.txt
+
+# 环境
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+.Rhistory
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.bak
+*.swp
+
+# 大文件目录（如果太大）
+# instances/  # 如果需要上传实例，注释掉这行
+
