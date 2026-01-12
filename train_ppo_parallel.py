@@ -73,7 +73,7 @@ PPO_CONFIG = {
     "batch_size": 1024,  # 批大小
     "n_epochs": 10,  # 每批优化轮数
     "max_episodes": 80000,  # 最大训练回合数
-    "total_timesteps": int(2e6),  # 总训练步数（200万步）
+    "total_timesteps": int(5e6),  # 总训练步数（500万步）
     "checkpoint_freq": 200000,  # 检查点保存频率（步数）
 }
 
@@ -100,7 +100,7 @@ CCBS_CONFIG = {
 
 # 环境配置（奖励参数已在ccbsenv.py中优化）
 RL_ENV_CONFIG = {
-    "max_step": 1024,
+    "max_step": 2048,  # 从1024增加到2048，给算法更多时间找到解
     "max_process_agent": 100,
 }
 
@@ -318,6 +318,9 @@ class VecEnvRewardCallback(RewardCallback):
         # done_reason统计：1=success, 2=timeout, 3=fail
         self.done_reasons = []  # 记录最近episode的done_reason
         self.done_reason_window = 100  # 统计窗口大小
+        # 课程学习跳过统计
+        self.curriculum_skipped_count = 0  # 累计跳过的episode数
+        self.curriculum_skipped_window = []  # 最近窗口的skip记录（用于计算比例）
     
     def _on_step(self) -> bool:
         # VecEnv兼容的episode统计
@@ -347,7 +350,18 @@ class VecEnvRewardCallback(RewardCallback):
                             if info.get('curriculum_skipped', False):
                                 # 这是课程学习跳过的空episode，不计入统计
                                 # 避免hard map env在早期产生大量空episode导致训练提前停止
+                                self.curriculum_skipped_count += 1
+                                self.curriculum_skipped_window.append(True)
+                                # 保持窗口大小
+                                if len(self.curriculum_skipped_window) > self.done_reason_window:
+                                    self.curriculum_skipped_window.pop(0)
                                 continue
+                            else:
+                                # 记录非跳过的episode
+                                self.curriculum_skipped_window.append(False)
+                                # 保持窗口大小
+                                if len(self.curriculum_skipped_window) > self.done_reason_window:
+                                    self.curriculum_skipped_window.pop(0)
                             
                             # VecMonitor会在infos中添加episode信息
                             # 注意：episode信息可能不存在，需要安全获取
@@ -393,7 +407,7 @@ class VecEnvRewardCallback(RewardCallback):
                                         else:
                                             self.converged = False
                                     
-                                    # 定期打印信息（包含done_reason统计）
+                                    # 定期打印信息（包含done_reason统计和CCBS算法状态）
                                     if self.episode_count % 10 == 0:
                                         avg_reward = np.mean(self.rewards[-10:]) if len(self.rewards) >= 10 else np.mean(self.rewards)
                                         
@@ -407,9 +421,30 @@ class VecEnvRewardCallback(RewardCallback):
                                             fail_count = recent_reasons.count(3)
                                             done_reason_stats = f", done_reason: success={success_count}/{total}, timeout={timeout_count}/{total}, fail={fail_count}/{total}"
                                         
+                                        # 统计课程学习跳过的比例
+                                        skip_stats = ""
+                                        if len(self.curriculum_skipped_window) >= 10:
+                                            recent_skips = self.curriculum_skipped_window[-self.done_reason_window:]
+                                            skip_count = sum(recent_skips)
+                                            total_episodes = len(recent_skips)
+                                            skip_ratio = skip_count / total_episodes if total_episodes > 0 else 0.0
+                                            skip_stats = f", 课程跳过: {skip_count}/{total_episodes} ({skip_ratio*100:.1f}%), 累计跳过: {self.curriculum_skipped_count}"
+                                        
+                                        # 统计CCBS算法运行状态（从当前环境的info中获取）
+                                        ccbs_stats_info = ""
+                                        if isinstance(info, dict) and 'ccbs_stats' in info:
+                                            stats = info['ccbs_stats']
+                                            ccbs_stats_info = (f", CCBS: step={stats.get('step', 0)}, "
+                                                             f"tree_size={stats.get('tree_size', 0)}, "
+                                                             f"conflicts=[card:{stats.get('cardinal_conflicts', 0)}, "
+                                                             f"semi:{stats.get('semi_cardinal_conflicts', 0)}, "
+                                                             f"non:{stats.get('non_cardinal_conflicts', 0)}], "
+                                                             f"searches={stats.get('low_level_searches', 0)}, "
+                                                             f"expanded={stats.get('low_level_expanded', 0)}")
+                                        
                                         print(f"Episode {self.episode_count}/{self.max_episodes}: "
                                               f"最近平均奖励={avg_reward:.4f}, 最佳奖励={self.best_reward:.4f}, "
-                                              f"收敛状态={'已收敛' if self.converged else '训练中'}{done_reason_stats}")
+                                              f"收敛状态={'已收敛' if self.converged else '训练中'}{done_reason_stats}{skip_stats}{ccbs_stats_info}")
                     except (KeyError, IndexError, TypeError, AttributeError) as e:
                         # 忽略单个环境的错误，继续处理其他环境
                         continue

@@ -34,7 +34,7 @@ class CCBSEnv(gym.Env):
         self.low_level_expanded = low_level_expanded
         self.alg = CCBS(map)
         self.max_process_agent = 100
-        self.max_step = 1024
+        self.max_step = 2048  # 从1024增加到2048，给算法更多时间找到解
         self.reward_1 = 15  # 当前节点满足约束且无其它冲突（从10提高到15）
         self.reward_2 = 2  # 分支数量权重系数
         self.reward_3 = -2  # 当前节点不满足约束（从-5改为-2，减少无效路径的累积惩罚）
@@ -230,9 +230,9 @@ class CCBSEnv(gym.Env):
             }
             
             info = {
-                'is_success': False,
-                'done_reason': 0,  # 0表示跳过（不是真正的done原因，但用于区分）
+                'done_reason': 4,  # 4表示课程学习跳过（区别于其他done原因）
                 'curriculum_skipped': True  # 标记这是课程学习跳过的episode
+                # 注意：不包含is_success，避免空episode稀释success_rate统计
             }
             
             # 设置标志，以便step()也能识别
@@ -273,9 +273,9 @@ class CCBSEnv(gym.Env):
         # 如果这是课程学习跳过的episode（在reset()时已设置done=True），直接返回
         if self.done and hasattr(self, 'curriculum_skipped') and getattr(self, 'curriculum_skipped', False):
             info = {
-                'is_success': False,
-                'done_reason': 0,
+                'done_reason': 4,  # 4表示课程学习跳过
                 'curriculum_skipped': True
+                # 注意：不包含is_success，避免空episode稀释success_rate统计
             }
             return self.state, 0.0, True, False, info
         
@@ -502,6 +502,18 @@ class CCBSEnv(gym.Env):
                 info['done_reason'] = 2  # timeout (max_step截断)
             else:
                 info['done_reason'] = 3  # fail (树空/无解)
+            
+            # 添加CCBS算法运行状态信息（仅在episode结束时输出，避免刷屏）
+            info['ccbs_stats'] = {
+                'step': self.current_step,
+                'tree_size': len(self.tree.container),
+                'cardinal_conflicts': len(self.node.cardinal_conflicts) if hasattr(self, 'node') else 0,
+                'semi_cardinal_conflicts': len(self.node.semicard_conflicts) if hasattr(self, 'node') else 0,
+                'non_cardinal_conflicts': len(self.node.conflicts) if hasattr(self, 'node') else 0,
+                'low_level_searches': self.low_level_searches,
+                'low_level_expanded': self.low_level_expanded,
+                'final_res': self.final_res is not None
+            }
         
         # 移除print以提高性能（20个并行环境会疯狂刷屏）
         # print("current step:", self.current_step)
