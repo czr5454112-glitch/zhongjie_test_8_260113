@@ -14,16 +14,34 @@ build/
 # 检查点文件（可选，如果需要包含则删除此行）
 checkpoints/
 
+# 模型和检查点
+*.zip
+*.pkl
+*.h5
+*.ckpt
+*.pt
+*.pth
+
 # 大型日志文件（可选）
 *.log
 training_console.log
 training_log_*.txt
+
+# 日志和临时文件
+logs/
+*.csv
+*.txt
+!requirements.txt
+!训练准备说明.md
+!奖励函数和收敛判断说明.md
+!实现方案分析.md
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
@@ -32,4 +50,10 @@ Thumbs.db
 # 临时文件
 *.tmp
 *.bak
-*~
+
+# TensorBoard
+events.out.tfevents.*
+
+# 环境变量
+.env
+.env.local
