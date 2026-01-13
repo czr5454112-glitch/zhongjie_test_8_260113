@@ -8,31 +8,23 @@ __pycache__/
 dist/
 build/
 
-# 模型文件（太大，不上传）
+# 模型和检查点
 *.zip
-*.pth
-*.pt
+*.pkl
 *.h5
 *.ckpt
+*.pt
+*.pth
 
-# 训练输出
-checkpoints/
+# 日志和临时文件
 logs/
-tensorboard/
 *.log
 *.csv
 *.txt
-!README.md
-!LICENSE
-test_evaluation_log.txt
-training_console.log
-training_log_*.txt
-
-# 环境
-venv/
-env/
-ENV/
-.venv
+!requirements.txt
+!训练准备说明.md
+!奖励函数和收敛判断说明.md
+!实现方案分析.md
 
 # IDE
 .vscode/
@@ -43,14 +35,11 @@ ENV/
 
 # 系统文件
 .DS_Store
-.Rhistory
 Thumbs.db
 
-# 临时文件
-*.tmp
-*.bak
-*.swp
+# TensorBoard
+events.out.tfevents.*
 
-# 大文件目录（如果太大）
-# instances/  # 如果需要上传实例，注释掉这行
-
+# 环境变量
+.env
+.env.local

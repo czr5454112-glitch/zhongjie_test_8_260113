@@ -22,7 +22,7 @@ class CCBSEnv(gym.Env):
     def __init__(self, task, ini_node, map: Map, expanded, time_elapsed, low_level_searches, low_level_expanded, tree):
         super(CCBSEnv, self).__init__()
         self.state = {}  # 状态初始化
-        self.reward = 0
+        self.episode_reward = 0.0  # episode累计奖励（仅用于记录，step()返回单步奖励）
         self.task = task
         self.ini_node = ini_node
         self.node = ini_node  # 当前CCBS节点
@@ -34,32 +34,38 @@ class CCBSEnv(gym.Env):
         self.low_level_expanded = low_level_expanded
         self.alg = CCBS(map)
         self.max_process_agent = 100
-        self.max_step = 1024
+        self.max_step = 4096  # 从2048增加到4096，给算法更多时间找到解
         self.reward_1 = 15  # 当前节点满足约束且无其它冲突（从10提高到15）
         self.reward_2 = 2  # 分支数量权重系数
-        self.reward_3 = -5  # 当前节点不满足约束
+        self.reward_3 = -2  # 当前节点不满足约束（从-5改为-2，减少无效路径的累积惩罚）
         self.cardinal_conflicts_weight = 2  # cardinal_conflict权重（从1提高到2）
         self.semicard_conflicts_weight = 1.5  # semicard_conflict权重（从1提高到1.5）
         self.non_cardinal_conflict_weight = 1.2  # non_cardinal冲突数量权重（从1提高到1.2）
-        self.reward_iter_pos = -0.2  # 每次迭代惩罚（从-0.5降低到-0.2）
-        self.reward_fail = -15  # episode失败惩罚（未找到解时的惩罚）
-        self.cost_weight = 0.01  # 目标函数权重
+        self.reward_iter_pos = -0.05  # 每次迭代惩罚（从-0.2降低到-0.05，避免长episode累积负回报过多）
+        self.reward_fail = -100  # episode失败惩罚（未找到解时的惩罚，从-15提高到-100避免失败也能拿高分）
+        self.cost_weight = 0.0  # 目标函数权重（暂时关闭，避免反向激励问题）
         self.high_level_generated = 1
         self.cur_id = 2
         self.lb = 0
         self.ub = float('inf')
         self.tree = tree
         self.final_res = None
-        self.action_space = Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+        # action_space改为[-1,1]，避免硬clip导致梯度语义差
+        self.action_space = Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        
+        # 课程学习参数（用于降低难度，让success_rate先>0）
+        self.curriculum_mode = True  # 是否启用课程学习
+        self.curriculum_max_agents = 25  # 当前阶段允许的最大agent数量（初始25，通过set_attr动态更新）
+        self._agent_count_cache = {}  # 缓存任务文件的agent数量，避免重复解析
 
-        # 状态空间：定义CBS状态空间
+        # 状态空间：定义CBS状态空间（统一使用Box，避免Discrete与np.array不匹配）
         self.observation_space = Dict({
-            'cardinal_conflict': Discrete(100),  # cardinal冲突数量
-            'semi_cardinal_conflict': Discrete(100),  # semi_cardinal冲突数量
-            'non_cardinal_conflict': Discrete(100),  # non_cardinal冲突数量
-            "agents_number": Discrete(100),  # 涉及冲突的智能体数量
-            'cost': Box(low=0, high=np.inf, shape=(1,), dtype=np.float32),  # 当前路径总和
-            'cur_depth': Discrete(1025)  # 当前搜索树深度
+            'cardinal_conflict': Box(low=0, high=1000, shape=(1,), dtype=np.float32),  # cardinal冲突数量
+            'semi_cardinal_conflict': Box(low=0, high=1000, shape=(1,), dtype=np.float32),  # semi_cardinal冲突数量
+            'non_cardinal_conflict': Box(low=0, high=5000, shape=(1,), dtype=np.float32),  # non_cardinal冲突数量
+            "agents_number": Box(low=0, high=1000, shape=(1,), dtype=np.float32),  # 涉及冲突的智能体数量
+            'cost': Box(low=0, high=1e9, shape=(1,), dtype=np.float32),  # 当前路径总和
+            'cur_depth': Box(low=0, high=4096, shape=(1,), dtype=np.float32)  # 当前搜索树深度（与max_step同步）
         })
 
     def reset(self, seed=None, **kwargs):
@@ -75,6 +81,8 @@ class CCBSEnv(gym.Env):
             max_retries = 30  # 增加重试次数，以便跳过有问题的任务文件
             last_error = None
             tried_files = set()  # 记录已尝试的文件，避免重复选择有问题的文件
+            task_file = None  # 初始化task_file，避免在except分支中未定义
+            curriculum_skipped = False  # 标记是否是课程学习跳过的episode
             
             for retry in range(max_retries):
                 try:
@@ -97,6 +105,27 @@ class CCBSEnv(gym.Env):
                         # 如果所有文件都试过了，重置记录（可能是新的一轮）
                         tried_files.clear()
                         available_files = training_files
+                    
+                    # 课程学习：根据agent数量过滤任务（降低难度）
+                    # 关键：如果过滤后无可用任务，返回空episode（立即done），而不是报错
+                    # 这样hard map的env在早期会快速done，不会真正训练，也不会干扰训练
+                    curriculum_skipped = False
+                    if self.curriculum_mode and self.curriculum_max_agents > 0:
+                        filtered_files = []
+                        for f in available_files:
+                            # 获取或缓存agent数量
+                            agent_count = self._get_agent_count_from_file(f)
+                            if agent_count is not None and agent_count <= self.curriculum_max_agents:
+                                filtered_files.append(f)
+                        
+                        # 如果过滤后有可用文件，使用过滤后的列表
+                        if len(filtered_files) > 0:
+                            available_files = filtered_files
+                        else:
+                            # 过滤后为空：说明当前课程阶段不允许训练此地图
+                            # 设置标志，返回空episode（立即done）
+                            curriculum_skipped = True
+                            break  # 跳出重试循环，进入空episode处理逻辑
                     
                     # 随机选择一个任务文件
                     task_file = random.choice(available_files)
@@ -181,9 +210,39 @@ class CCBSEnv(gym.Env):
                     # 如果所有重试都失败
                     raise RuntimeError(f"reset时重新选择任务失败，已重试{max_retries}次。最后错误: {last_error}")
         
-        # 重置环境状态
+        # 检查是否是课程学习跳过的episode（当前阶段不允许训练此地图）
+        if curriculum_skipped:
+            # 返回空episode（立即done，reward=0）
+            # 这样hard map的env在早期会快速done，不会真正训练，也不会干扰训练
+            self.done = True
+            self.episode_reward = 0.0
+            self.current_step = 1
+            self.final_res = None
+            
+            # 返回一个有效的初始状态（全零状态，表示"跳过"）
+            self.state = {
+                'cardinal_conflict': np.array([0.0], dtype=np.float32),
+                'semi_cardinal_conflict': np.array([0.0], dtype=np.float32),
+                'non_cardinal_conflict': np.array([0.0], dtype=np.float32),
+                'agents_number': np.array([0.0], dtype=np.float32),
+                'cost': np.array([0.0], dtype=np.float32),
+                'cur_depth': np.array([0.0], dtype=np.float32)
+            }
+            
+            info = {
+                'done_reason': 4,  # 4表示课程学习跳过（区别于其他done原因）
+                'curriculum_skipped': True  # 标记这是课程学习跳过的episode
+                # 注意：不包含is_success，避免空episode稀释success_rate统计
+            }
+            
+            # 设置标志，以便step()也能识别
+            self.curriculum_skipped = True
+            
+            return self.state, info
+        
+        # 重置环境状态（正常情况）
         self.done = False
-        self.reward = 0
+        self.episode_reward = 0.0  # 重置episode累计奖励
         self.current_step = 1
         self.low_level_searches = 0
         self.low_level_expanded = 0
@@ -198,49 +257,73 @@ class CCBSEnv(gym.Env):
         paths = self.alg.get_paths(self.node, len(self.task.agents))
 
         self.state = {
-            'cardinal_conflict': np.array([len(self.node.cardinal_conflicts)]).astype(np.int8),
-            'semi_cardinal_conflict': np.array([len(self.node.semicard_conflicts)]).astype(np.int8),
-            'non_cardinal_conflict': np.array([len(self.node.conflicts)]).astype(np.int8),
-            "agents_number": np.array([self.alg.cal_conflict_agent(paths)]).astype(np.int8),
-            'cost': np.array([self.alg.get_spath_cost(paths)]).astype(np.float32),
-            'cur_depth': np.array([self.current_step]).astype(np.int32)
+            'cardinal_conflict': np.array([float(len(self.node.cardinal_conflicts))], dtype=np.float32),
+            'semi_cardinal_conflict': np.array([float(len(self.node.semicard_conflicts))], dtype=np.float32),
+            'non_cardinal_conflict': np.array([float(len(self.node.conflicts))], dtype=np.float32),
+            "agents_number": np.array([float(self.alg.cal_conflict_agent(paths))], dtype=np.float32),
+            'cost': np.array([float(self.alg.get_spath_cost(paths))], dtype=np.float32),
+            'cur_depth': np.array([float(self.current_step)], dtype=np.float32)
         }
         info = {}
-        self.action_space = Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+        # action_space改为[-1,1]，避免硬clip导致梯度语义差
+        self.action_space = Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
         return self.state, info
 
     def step(self, action):
-        # 修复action处理：确保action是标量
-        # action通常是np.ndarray(shape=(1,))，需要转换为标量
-        if isinstance(action, np.ndarray):
-            action_value = float(action[0])
-        elif isinstance(action, (list, tuple)):
-            action_value = float(action[0])
-        else:
-            action_value = float(action)
+        # 如果这是课程学习跳过的episode（在reset()时已设置done=True），直接返回
+        if self.done and hasattr(self, 'curriculum_skipped') and getattr(self, 'curriculum_skipped', False):
+            info = {
+                'done_reason': 4,  # 4表示课程学习跳过
+                'curriculum_skipped': True
+                # 注意：不包含is_success，避免空episode稀释success_rate统计
+            }
+            return self.state, 0.0, True, False, info
         
-        # 确保action_value在[0, 1]范围内
+        # 修复action处理：从[-1,1]线性映射到[0,1]，避免硬clip
+        # action通常是np.ndarray(shape=(1,))，在[-1,1]范围内
+        if isinstance(action, np.ndarray):
+            action_raw = float(action[0])
+        elif isinstance(action, (list, tuple)):
+            action_raw = float(action[0])
+        else:
+            action_raw = float(action)
+        
+        # 线性映射：[-1,1] -> [0,1]
+        action_value = (action_raw + 1.0) / 2.0
+        # 理论上已经在[0,1]范围内，但为了安全可以加一个很小的clip
         action_value = np.clip(action_value, 0.0, 1.0)
+        
+        # 初始化单步奖励和truncated标志（step()必须返回单步奖励，不是累计奖励）
+        step_reward = 0.0
+        truncated = False  # 必须：保证所有路径都定义，避免UnboundLocalError
         
         node = self.node.create_node_move_conflicts()
         paths = self.alg.get_paths(node, len(self.task.agents))
 
         if not node.conflicts and not node.semicard_conflicts and not node.cardinal_conflicts:
             self.final_res = node
-            print("No conflicts, solution found successfully")
+            # 找到解时给予成功奖励（单步奖励）
+            step_reward += self.reward_1 + self.reward_2 / self.current_step
+            self.ub = min(self.ub, node.cost)  # 更新上界
+            # print("No conflicts, solution found successfully")  # 移除print以提高性能
             self.done = True
 
-        elif self.current_step >= self.max_step or (len(self.tree.container) == 0 and self.current_step > 1):
-            print('No Solution')
+        elif self.current_step >= self.max_step:
+            # 超步截断：中等惩罚（比无解惩罚更温和），使用truncated语义更正确
             self.done = True
-            # 添加失败惩罚
-            self.reward += self.reward_fail
+            truncated = True
+            step_reward += -30  # 比无解惩罚(-100)更温和，鼓励探索
+        elif len(self.tree.container) == 0 and self.current_step > 1:
+            # 无解/树空：重罚
+            self.done = True
+            # 添加失败惩罚（单步奖励）
+            step_reward += self.reward_fail
 
         else:
             node.cost -= node.h
             all_conflicts = node.cardinal_conflicts + node.semicard_conflicts + node.conflicts
             all_conflicts.sort(key=lambda x: x.t)
-            print(f"current all conflicts: {all_conflicts}")
+            # print(f"current all conflicts: {all_conflicts}")  # 移除print以提高性能
 
             conflict_index = 0
             if len(all_conflicts) == 0:
@@ -252,7 +335,7 @@ class CCBSEnv(gym.Env):
                 conflict_index = max(0, min(conflict_index, len(all_conflicts) - 1))  # 确保索引有效
             
             conflict = all_conflicts[conflict_index]
-            print(f"selected conflict is {conflict}")
+            # print(f"selected conflict is {conflict}")  # 移除print以提高性能
 
             corridor_constraints = []
             if self.alg.config.use_corridor_symmetry:
@@ -321,9 +404,15 @@ class CCBSEnv(gym.Env):
                         # l_global_reward = self.reward_iter_pos * (1 - left_index / len(self.node_list))
                         l_global_reward = self.reward_iter_pos
                         self.lb = max(self.lb, left_node.cost)
-                    l_reward_1 = self.semicard_conflicts_weight * (len(node.semicard_conflicts) - len(left_node.semicard_conflicts)) + \
-                                 self.cardinal_conflicts_weight * (len(node.cardinal_conflicts) - len(left_node.cardinal_conflicts)) + \
-                                 self.non_cardinal_conflict_weight * (len(node.conflicts) - len(left_node.conflicts))
+                    
+                    # 冲突差分奖励归一化（按父节点冲突总数，避免跨地图尺度差异）
+                    parent_total = len(node.cardinal_conflicts) + len(node.semicard_conflicts) + len(node.conflicts)
+                    scale = max(1.0, float(parent_total))
+                    l_reward_1 = (
+                        self.semicard_conflicts_weight * (len(node.semicard_conflicts) - len(left_node.semicard_conflicts)) +
+                        self.cardinal_conflicts_weight * (len(node.cardinal_conflicts) - len(left_node.cardinal_conflicts)) +
+                        self.non_cardinal_conflict_weight * (len(node.conflicts) - len(left_node.conflicts))
+                    ) / scale
 
                     l_reward_2 = self.cost_weight * min(left_node.cost - self.lb, self.ub-left_node.cost)
                     l_total_reward = l_global_reward + l_reward_1 + l_reward_2
@@ -357,9 +446,15 @@ class CCBSEnv(gym.Env):
                         # r_global_reward = self.reward_iter_pos * (1 - right_index / len(self.node_list))
                         r_global_reward = self.reward_iter_pos
                         self.lb = max(self.lb, right_node.cost)
-                    r_reward_1 = self.semicard_conflicts_weight * (len(node.semicard_conflicts) - len(right_node.semicard_conflicts)) + \
-                                 self.cardinal_conflicts_weight * (len(node.cardinal_conflicts) - len(right_node.cardinal_conflicts)) + \
-                                 self.non_cardinal_conflict_weight * (len(node.conflicts) - len(right_node.conflicts))
+                    
+                    # 冲突差分奖励归一化（按父节点冲突总数，避免跨地图尺度差异）
+                    parent_total = len(node.cardinal_conflicts) + len(node.semicard_conflicts) + len(node.conflicts)
+                    scale = max(1.0, float(parent_total))
+                    r_reward_1 = (
+                        self.semicard_conflicts_weight * (len(node.semicard_conflicts) - len(right_node.semicard_conflicts)) +
+                        self.cardinal_conflicts_weight * (len(node.cardinal_conflicts) - len(right_node.cardinal_conflicts)) +
+                        self.non_cardinal_conflict_weight * (len(node.conflicts) - len(right_node.conflicts))
+                    ) / scale
 
                     r_reward_2 = self.cost_weight * min(right_node.cost - self.lb, self.ub - right_node.cost)
                     r_total_reward = r_global_reward + r_reward_1 + r_reward_2
@@ -369,7 +464,7 @@ class CCBSEnv(gym.Env):
             else:
                 r_total_reward = self.reward_3
 
-            self.reward += (l_total_reward + r_total_reward) / 2
+            step_reward += (l_total_reward + r_total_reward) / 2
 
             self.current_step += 1
 
@@ -379,36 +474,77 @@ class CCBSEnv(gym.Env):
 
                 paths = self.alg.get_paths(node=self.node, agents_size=len(self.task.agents))
                 soc = self.alg.get_spath_cost(paths)
-                self.state['cardinal_conflict'] = np.array([len(self.node.cardinal_conflicts)]).astype(np.int8)
-                self.state['semi_cardinal_conflict'] = np.array([len(self.node.semicard_conflicts)]).astype(np.int8)
-                self.state['non_cardinal_conflict'] = np.array([len(self.node.conflicts)]).astype(np.int8)
-                self.state['agents_number'] = np.array([self.alg.cal_conflict_agent(paths)]).astype(np.int8)
-                self.state['cost'] = np.array([soc]).astype(np.float32)
-                self.state['cur_depth'] = np.array([self.current_step]).astype(np.int32)
+                self.state['cardinal_conflict'] = np.array([float(len(self.node.cardinal_conflicts))], dtype=np.float32)
+                self.state['semi_cardinal_conflict'] = np.array([float(len(self.node.semicard_conflicts))], dtype=np.float32)
+                self.state['non_cardinal_conflict'] = np.array([float(len(self.node.conflicts))], dtype=np.float32)
+                self.state['agents_number'] = np.array([float(self.alg.cal_conflict_agent(paths))], dtype=np.float32)
+                self.state['cost'] = np.array([float(soc)], dtype=np.float32)
+                self.state['cur_depth'] = np.array([float(self.current_step)], dtype=np.float32)
             else:
                 self.done = True
-                # 如果树为空且未找到解，添加失败惩罚
+                # 如果树为空且未找到解，添加失败惩罚（单步奖励）
                 if self.final_res is None:
-                    self.reward += self.reward_fail
+                    step_reward += self.reward_fail
 
-        truncated = False
+        # 累计episode奖励（仅用于记录，step()返回单步奖励）
+        self.episode_reward += step_reward
+
         info = {}
         
-        # 当 episode 结束时，添加 episode 信息到 info（VecMonitor 需要）
+        # VecMonitor会自动生成episode信息，不需要手动设置
+        # 添加自定义字段（成功标志和done_reason统计）
         if self.done:
-            info['episode'] = {
-                'r': float(self.reward),  # episode 总奖励
-                'l': int(self.current_step),  # episode 长度（步数）
+            info['is_success'] = (self.final_res is not None)
+            # done_reason: 0=running, 1=success, 2=timeout, 3=fail
+            if self.final_res is not None:
+                info['done_reason'] = 1  # success
+            elif truncated:
+                info['done_reason'] = 2  # timeout (max_step截断)
+            else:
+                info['done_reason'] = 3  # fail (树空/无解)
+            
+            # 添加CCBS算法运行状态信息（仅在episode结束时输出，避免刷屏）
+            info['ccbs_stats'] = {
+                'step': self.current_step,
+                'tree_size': len(self.tree.container),
+                'cardinal_conflicts': len(self.node.cardinal_conflicts) if hasattr(self, 'node') else 0,
+                'semi_cardinal_conflicts': len(self.node.semicard_conflicts) if hasattr(self, 'node') else 0,
+                'non_cardinal_conflicts': len(self.node.conflicts) if hasattr(self, 'node') else 0,
+                'low_level_searches': self.low_level_searches,
+                'low_level_expanded': self.low_level_expanded,
+                'final_res': self.final_res is not None
             }
         
-        print("current step:", self.current_step)
-        print("current cardinal:", self.state['cardinal_conflict'])
-        print("current semi_cardinal:", self.state['semi_cardinal_conflict'])
-        print("current non_cardinal:", self.state['non_cardinal_conflict'])
-        print("current reward:", self.reward)
-        print("is done:", self.done)
+        # 移除print以提高性能（20个并行环境会疯狂刷屏）
+        # print("current step:", self.current_step)
+        # print("current cardinal:", self.state['cardinal_conflict'])
+        # print("current semi_cardinal:", self.state['semi_cardinal_conflict'])
+        # print("current non_cardinal:", self.state['non_cardinal_conflict'])
+        # print("current reward:", step_reward)
+        # print("is done:", self.done)
 
-        return self.state, self.reward, self.done, truncated, info
+        # 返回单步奖励（不是累计奖励）
+        return self.state, float(step_reward), self.done, truncated, info
+    
+    def _get_agent_count_from_file(self, task_file):
+        """从任务文件中获取agent数量（带缓存）"""
+        # 检查缓存
+        if task_file in self._agent_count_cache:
+            return self._agent_count_cache[task_file]
+        
+        # 解析XML获取agent数量
+        try:
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(task_file)
+            root = tree.getroot()
+            agents = root.findall('.//agent')
+            agent_count = len(agents)
+            # 缓存结果
+            self._agent_count_cache[task_file] = agent_count
+            return agent_count
+        except Exception as e:
+            # 解析失败，返回None（会在后续重试逻辑中处理）
+            return None
 
 
 # 定义回调类
@@ -454,11 +590,6 @@ class RewardCallback(BaseCallback):
             
             self.rewards.append(reward)
             self.episode_count += 1
-        except (KeyError, TypeError, ValueError, AttributeError) as e:
-            # 如果获取信息失败，记录错误但继续训练
-            if self.episode_count % 100 == 0:  # 每100个episode才打印一次，避免刷屏
-                print(f"[警告] RewardCallback获取episode信息时出错: {e}，将跳过此步骤")
-            return True
             
             # 更新最佳奖励
             if reward > self.best_reward:
@@ -486,6 +617,11 @@ class RewardCallback(BaseCallback):
                 print(f"Episode {self.episode_count}/{self.max_episodes}: "
                       f"最近平均奖励={avg_reward:.4f}, 最佳奖励={self.best_reward:.4f}, "
                       f"收敛状态={'已收敛' if self.converged else '训练中'}")
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            # 如果获取信息失败，记录错误但继续训练
+            if self.episode_count % 100 == 0:  # 每100个episode才打印一次，避免刷屏
+                print(f"[警告] RewardCallback获取episode信息时出错: {e}，将跳过此步骤")
+            return True
         
         if self.episode_count >= self.max_episodes:
             print(f"已完成 {self.max_episodes} 个回合，停止训练")

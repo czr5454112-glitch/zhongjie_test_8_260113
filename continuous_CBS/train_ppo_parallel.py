@@ -23,14 +23,15 @@ from map import Map
 from structs import Task, Solution
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
-from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
+# CheckpointCallback已删除，改用TimeLimitedRewardCallback的保存逻辑
+# from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
 
 # ============================================================================
 # ============================ 配置区域 ======================================
 # ============================================================================
 
 # 训练时间限制（小时）
-TRAINING_TIME_LIMIT_HOURS = 88
+TRAINING_TIME_LIMIT_HOURS = 100
 
 # 地图配置列表
 MAP_CONFIGS = [
@@ -72,7 +73,7 @@ PPO_CONFIG = {
     "batch_size": 1024,  # 批大小
     "n_epochs": 10,  # 每批优化轮数
     "max_episodes": 80000,  # 最大训练回合数
-    "total_timesteps": int(1e6),  # 总训练步数（100万步）
+    "total_timesteps": int(5e6),  # 总训练步数（500万步）
     "checkpoint_freq": 200000,  # 检查点保存频率（步数）
 }
 
@@ -99,7 +100,7 @@ CCBS_CONFIG = {
 
 # 环境配置（奖励参数已在ccbsenv.py中优化）
 RL_ENV_CONFIG = {
-    "max_step": 1024,
+    "max_step": 4096,  # 从2048增加到4096，给算法更多时间找到解
     "max_process_agent": 100,
 }
 
@@ -303,11 +304,23 @@ def create_env_for_map(map_path, train_task_dir, env_id=0):
 
 class VecEnvRewardCallback(RewardCallback):
     """VecEnv兼容的奖励回调，修复VecEnv下的episode统计问题"""
-    def __init__(self, max_episodes, convergence_window=100, convergence_threshold=0.01, *args, **kwargs):
+    def __init__(self, max_episodes, convergence_window=100, convergence_threshold=0.01, 
+                 patience=2000, min_delta=0.1, mean_min=1.0, *args, **kwargs):
         super().__init__(max_episodes=max_episodes, 
                         convergence_window=convergence_window,
                         convergence_threshold=convergence_threshold, 
                         *args, **kwargs)
+        # patience机制：best_reward长时间无提升时停止
+        self.patience = patience
+        self.min_delta = min_delta  # 奖励提升的最小阈值
+        self.last_improve_ep = 0  # 上次提升的episode
+        self.mean_min = mean_min  # 收敛判定的最小均值门槛
+        # done_reason统计：1=success, 2=timeout, 3=fail
+        self.done_reasons = []  # 记录最近episode的done_reason
+        self.done_reason_window = 100  # 统计窗口大小
+        # 课程学习跳过统计
+        self.curriculum_skipped_count = 0  # 累计跳过的episode数
+        self.curriculum_skipped_window = []  # 最近窗口的skip记录（用于计算比例）
     
     def _on_step(self) -> bool:
         # VecEnv兼容的episode统计
@@ -333,6 +346,23 @@ class VecEnvRewardCallback(RewardCallback):
                         done = dones[i] if i < len(dones) else False
                         
                         if done and isinstance(info, dict):
+                            # 关键修复：忽略课程学习跳过的episode（避免episode计数炸穿）
+                            if info.get('curriculum_skipped', False):
+                                # 这是课程学习跳过的空episode，不计入统计
+                                # 避免hard map env在早期产生大量空episode导致训练提前停止
+                                self.curriculum_skipped_count += 1
+                                self.curriculum_skipped_window.append(True)
+                                # 保持窗口大小
+                                if len(self.curriculum_skipped_window) > self.done_reason_window:
+                                    self.curriculum_skipped_window.pop(0)
+                                continue
+                            else:
+                                # 记录非跳过的episode
+                                self.curriculum_skipped_window.append(False)
+                                # 保持窗口大小
+                                if len(self.curriculum_skipped_window) > self.done_reason_window:
+                                    self.curriculum_skipped_window.pop(0)
+                            
                             # VecMonitor会在infos中添加episode信息
                             # 注意：episode信息可能不存在，需要安全获取
                             episode_info = info.get('episode', None)
@@ -350,17 +380,25 @@ class VecEnvRewardCallback(RewardCallback):
                                     self.rewards.append(float(episode_reward))
                                     self.episode_count += 1
                                     
-                                    # 更新最佳奖励
-                                    if episode_reward > self.best_reward:
-                                        self.best_reward = episode_reward
+                                    # 统计done_reason（从info中获取，VecMonitor会保留env的info字段）
+                                    done_reason = info.get('done_reason', 0)
+                                    if done_reason > 0:  # 只记录有效的done_reason
+                                        self.done_reasons.append(done_reason)
                                     
-                                    # 检测收敛
+                                    # 更新最佳奖励（patience机制）
+                                    if episode_reward > self.best_reward + self.min_delta:
+                                        self.best_reward = episode_reward
+                                        self.last_improve_ep = self.episode_count
+                                    
+                                    # 检测收敛（加epsilon + mean_min门槛，避免均值接近0时误判）
                                     if len(self.rewards) >= self.convergence_window:
                                         recent_rewards = self.rewards[-self.convergence_window:]
-                                        reward_std = np.std(recent_rewards)
-                                        reward_mean = np.mean(recent_rewards)
+                                        reward_std = float(np.std(recent_rewards))
+                                        reward_mean = float(np.mean(recent_rewards))
+                                        eps = 1e-6
                                         
-                                        if reward_std < abs(reward_mean) * self.convergence_threshold:
+                                        # 收敛条件：均值大于门槛 且 标准差小于阈值
+                                        if abs(reward_mean) > self.mean_min and reward_std < max(eps, abs(reward_mean)) * self.convergence_threshold:
                                             if not self.converged:
                                                 self.converged = True
                                                 print(f"[收敛检测] Episode {self.episode_count}: 检测到收敛! "
@@ -369,12 +407,61 @@ class VecEnvRewardCallback(RewardCallback):
                                         else:
                                             self.converged = False
                                     
-                                    # 定期打印信息
+                                    # 收集CCBS统计信息（用于后续汇总显示）
+                                    if isinstance(info, dict) and 'ccbs_stats' in info:
+                                        if not hasattr(self, 'ccbs_stats_list'):
+                                            self.ccbs_stats_list = []
+                                        self.ccbs_stats_list.append(info['ccbs_stats'])
+                                        # 保持列表大小（只保留最近100个episode的统计）
+                                        if len(self.ccbs_stats_list) > 100:
+                                            self.ccbs_stats_list.pop(0)
+                                    
+                                    # 定期打印信息（包含done_reason统计和CCBS算法状态）
                                     if self.episode_count % 10 == 0:
                                         avg_reward = np.mean(self.rewards[-10:]) if len(self.rewards) >= 10 else np.mean(self.rewards)
+                                        
+                                        # 统计最近窗口的done_reason分布
+                                        done_reason_stats = ""
+                                        if len(self.done_reasons) >= 10:
+                                            recent_reasons = self.done_reasons[-self.done_reason_window:]
+                                            total = len(recent_reasons)
+                                            success_count = recent_reasons.count(1)
+                                            timeout_count = recent_reasons.count(2)
+                                            fail_count = recent_reasons.count(3)
+                                            done_reason_stats = f", done_reason: success={success_count}/{total}, timeout={timeout_count}/{total}, fail={fail_count}/{total}"
+                                        
+                                        # 统计课程学习跳过的比例
+                                        skip_stats = ""
+                                        if len(self.curriculum_skipped_window) >= 10:
+                                            recent_skips = self.curriculum_skipped_window[-self.done_reason_window:]
+                                            skip_count = sum(recent_skips)
+                                            total_episodes = len(recent_skips)
+                                            skip_ratio = skip_count / total_episodes if total_episodes > 0 else 0.0
+                                            skip_stats = f", 课程跳过: {skip_count}/{total_episodes} ({skip_ratio*100:.1f}%), 累计跳过: {self.curriculum_skipped_count}"
+                                        
+                                        # 统计CCBS算法运行状态（从收集的统计信息中计算平均值）
+                                        ccbs_stats_info = ""
+                                        if hasattr(self, 'ccbs_stats_list') and len(self.ccbs_stats_list) > 0:
+                                            # 计算最近10个episode的CCBS统计平均值
+                                            recent_stats = self.ccbs_stats_list[-10:] if len(self.ccbs_stats_list) >= 10 else self.ccbs_stats_list
+                                            avg_step = np.mean([s.get('step', 0) for s in recent_stats])
+                                            avg_tree_size = np.mean([s.get('tree_size', 0) for s in recent_stats])
+                                            avg_card = np.mean([s.get('cardinal_conflicts', 0) for s in recent_stats])
+                                            avg_semi = np.mean([s.get('semi_cardinal_conflicts', 0) for s in recent_stats])
+                                            avg_non = np.mean([s.get('non_cardinal_conflicts', 0) for s in recent_stats])
+                                            avg_searches = np.mean([s.get('low_level_searches', 0) for s in recent_stats])
+                                            avg_expanded = np.mean([s.get('low_level_expanded', 0) for s in recent_stats])
+                                            success_found = sum([1 for s in recent_stats if s.get('final_res', False)])
+                                            
+                                            ccbs_stats_info = (f", CCBS(最近{len(recent_stats)}个episode平均): "
+                                                             f"step={avg_step:.1f}, tree_size={avg_tree_size:.1f}, "
+                                                             f"conflicts=[card:{avg_card:.1f}, semi:{avg_semi:.1f}, non:{avg_non:.1f}], "
+                                                             f"searches={avg_searches:.1f}, expanded={avg_expanded:.1f}, "
+                                                             f"success={success_found}/{len(recent_stats)}")
+                                        
                                         print(f"Episode {self.episode_count}/{self.max_episodes}: "
                                               f"最近平均奖励={avg_reward:.4f}, 最佳奖励={self.best_reward:.4f}, "
-                                              f"收敛状态={'已收敛' if self.converged else '训练中'}")
+                                              f"收敛状态={'已收敛' if self.converged else '训练中'}{done_reason_stats}{skip_stats}{ccbs_stats_info}")
                     except (KeyError, IndexError, TypeError, AttributeError) as e:
                         # 忽略单个环境的错误，继续处理其他环境
                         continue
@@ -390,21 +477,38 @@ class VecEnvRewardCallback(RewardCallback):
             print(f"已完成 {self.max_episodes} 个回合，停止训练")
             return False
         
+        # 检查patience机制：best_reward长时间无提升时停止
+        if self.episode_count - self.last_improve_ep >= self.patience:
+            print(f"[Patience停止] Episode {self.episode_count}: 最佳奖励{self.patience}个episode无提升，停止训练。"
+                  f"最佳奖励={self.best_reward:.4f}, 上次提升在Episode {self.last_improve_ep}")
+            return False
+        
         return True
 
 
 class TimeLimitedRewardCallback(VecEnvRewardCallback):
-    """增强的回调，支持时间限制和检查点保存"""
+    """增强的回调，支持时间限制和检查点保存，以及课程学习进度更新"""
     def __init__(self, model, checkpoint_path, checkpoint_freq, max_episodes, 
-                 convergence_window=100, convergence_threshold=0.01, *args, **kwargs):
+                 convergence_window=100, convergence_threshold=0.01,
+                 patience=2000, min_delta=0.1, mean_min=1.0, 
+                 curriculum_start_max_agents=25, curriculum_final_max_agents=100,
+                 curriculum_timesteps=600000, *args, **kwargs):
         super().__init__(max_episodes=max_episodes, 
                         convergence_window=convergence_window,
-                        convergence_threshold=convergence_threshold, 
+                        convergence_threshold=convergence_threshold,
+                        patience=patience, min_delta=min_delta, mean_min=mean_min,
                         *args, **kwargs)
         self.model = model
         self.checkpoint_path = checkpoint_path
         self.checkpoint_freq = checkpoint_freq
         self.last_checkpoint_step = 0
+        
+        # 课程学习参数
+        self.curriculum_start_max_agents = curriculum_start_max_agents  # 初始最大agent数
+        self.curriculum_final_max_agents = curriculum_final_max_agents  # 最终最大agent数
+        self.curriculum_timesteps = curriculum_timesteps  # 课程学习爬坡周期（600k步）
+        self.last_curriculum_update_step = 0  # 上次更新课程进度时的步数
+        self.curriculum_update_freq = 50000  # 每50k步更新一次课程进度
     
     def _on_step(self) -> bool:
         result = super()._on_step()
@@ -415,13 +519,13 @@ class TimeLimitedRewardCallback(VecEnvRewardCallback):
             print(f"\n[时间限制] 已达到训练时间限制 ({TRAINING_TIME_LIMIT_HOURS}小时)，停止训练")
             return False
         
-        # 定期保存检查点（基于步数）
         # 从模型获取当前步数
         if hasattr(self.model, 'num_timesteps'):
             num_timesteps = self.model.num_timesteps
         else:
             num_timesteps = self.n_calls * PARALLEL_CONFIG["total_num_envs"]  # 使用调用次数估算
         
+        # 定期保存检查点（基于步数）
         if num_timesteps - self.last_checkpoint_step >= self.checkpoint_freq:
             checkpoint_file = f"{self.checkpoint_path}_checkpoint_step{num_timesteps}"
             try:
@@ -431,11 +535,51 @@ class TimeLimitedRewardCallback(VecEnvRewardCallback):
             except Exception as e:
                 print(f"[检查点] 保存失败: {e}")
         
+        # 更新课程学习进度（基于训练进度线性增加max_agents）
+        if num_timesteps - self.last_curriculum_update_step >= self.curriculum_update_freq:
+            self._update_curriculum(num_timesteps)
+            self.last_curriculum_update_step = num_timesteps
+        
         return result
+    
+    def _update_curriculum(self, num_timesteps):
+        """更新所有环境的课程学习进度（基于课程学习周期线性增加max_agents）"""
+        # 计算课程学习进度（0.0-1.0），基于单独的curriculum_timesteps，而不是total_timesteps
+        progress = min(1.0, float(num_timesteps) / float(self.curriculum_timesteps))
+        
+        # 线性插值计算当前max_agents
+        current_max_agents = int(
+            self.curriculum_start_max_agents + 
+            (self.curriculum_final_max_agents - self.curriculum_start_max_agents) * progress
+        )
+        
+        # 更新所有环境的curriculum_max_agents
+        # 使用VecEnv的set_attr方法（这是SubprocVecEnv下唯一有效的方式）
+        try:
+            if hasattr(self.model, 'env') and hasattr(self.model.env, 'set_attr'):
+                try:
+                    self.model.env.set_attr('curriculum_max_agents', current_max_agents)
+                    print(f"[课程学习] 课程进度 {progress*100:.1f}% ({num_timesteps}/{self.curriculum_timesteps}步), "
+                          f"更新max_agents: {self.curriculum_start_max_agents} → {current_max_agents} (已同步到所有环境)")
+                except Exception as set_attr_error:
+                    print(f"[课程学习] 课程进度 {progress*100:.1f}% ({num_timesteps}/{self.curriculum_timesteps}步), "
+                          f"更新max_agents: {self.curriculum_start_max_agents} → {current_max_agents} (set_attr失败: {set_attr_error})")
+            else:
+                print(f"[课程学习] 课程进度 {progress*100:.1f}% ({num_timesteps}/{self.curriculum_timesteps}步), "
+                      f"更新max_agents: {self.curriculum_start_max_agents} → {current_max_agents} (env不支持set_attr)")
+        except Exception as e:
+            # 如果更新失败，不影响训练
+            if not hasattr(self, '_curriculum_error_logged'):
+                print(f"[警告] 更新课程学习进度时出错: {e}，将跳过此步骤")
+                self._curriculum_error_logged = True
 
 
-def create_parallel_envs():
-    """创建并行环境（修复子进程缓存问题）"""
+def create_parallel_envs(initial_max_agents=25):
+    """创建并行环境（修复子进程缓存问题）
+    
+    参数:
+        initial_max_agents: 初始课程学习阶段的最大agent数，只创建有符合条件任务的地图的env
+    """
     env_constructors = []
     env_id = 0
     
@@ -466,6 +610,34 @@ def create_parallel_envs():
             print(f"[警告] 地图 {map_name} 没有可用的训练任务，跳过")
             continue
         
+        # 课程学习：预先创建所有地图的env（包括hard map）
+        # 在reset()时，如果当前课程阶段不允许，会返回空episode（立即done），不会真正训练
+        # 当课程进度允许时，正常采样任务并训练
+        import xml.etree.ElementTree as ET
+        agent_counts = []
+        for f in training_files:
+            try:
+                tree = ET.parse(f)
+                root = tree.getroot()
+                agents = root.findall('.//agent')
+                agent_count = len(agents)
+                agent_counts.append(agent_count)
+            except:
+                continue
+        
+        # 统计符合初始阶段的任务数量（用于日志）
+        if agent_counts:
+            valid_count = sum(1 for c in agent_counts if c <= initial_max_agents)
+            min_agents = min(agent_counts)
+            max_agents = max(agent_counts)
+            if valid_count == 0:
+                print(f"[课程学习] 地图 {map_name}: agent范围 {min_agents}-{max_agents}, "
+                      f"所有任务都超过初始max_agents({initial_max_agents})，"
+                      f"env已创建但会在早期返回空episode（课程进度允许时自动激活）")
+            else:
+                print(f"[课程学习] 地图 {map_name}: agent范围 {min_agents}-{max_agents}, "
+                      f"{valid_count}/{len(training_files)}个任务符合初始阶段")
+        
         num_envs = PARALLEL_CONFIG["num_envs_per_map"]
         
         for i in range(num_envs):
@@ -473,7 +645,9 @@ def create_parallel_envs():
             env_constructors.append(create_env_for_map(map_path, train_task_dir, env_id))
             env_id += 1
         
-        print(f"[信息] 地图 {map_name}: {num_envs} 个环境，{len(training_files)} 个任务文件")
+        valid_count = sum(1 for c in agent_counts if c <= initial_max_agents) if agent_counts else len(training_files)
+        print(f"[信息] 地图 {map_name}: {num_envs} 个环境，{len(training_files)} 个任务文件，"
+              f"其中{valid_count}个符合初始课程阶段(<= {initial_max_agents} agents)")
     
     if len(env_constructors) == 0:
         raise RuntimeError("没有可用的环境构造函数，请检查地图配置")
@@ -493,7 +667,8 @@ def create_parallel_envs():
     # 保存monitor.csv以便后续分析（可选，如果不需要可以设为None）
     monitor_file = os.path.join(SCRIPT_DIR, "logs", "monitor.csv")
     os.makedirs(os.path.dirname(monitor_file), exist_ok=True)
-    env = VecMonitor(env, filename=monitor_file, info_keywords=('episode',))
+    # episode是VecMonitor自动生成的dict字段，不应放在info_keywords中
+    env = VecMonitor(env, filename=monitor_file, info_keywords=())
     
     return env
 
@@ -561,24 +736,22 @@ def train_parallel():
     print("\n[步骤4] 准备训练回调...")
     model_save_path = os.path.join(SCRIPT_DIR, "ppo_ccbs_multi_map")
     
-    # 使用CheckpointCallback定期保存（基于步数）
-    checkpoint_cb = CheckpointCallback(
-        save_freq=PPO_CONFIG["checkpoint_freq"],
-        save_path=os.path.join(SCRIPT_DIR, "checkpoints"),
-        name_prefix="ppo_ccbs_policy"
-    )
-    
-    # 使用TimeLimitedRewardCallback处理回合数限制和时间限制
+    # 使用TimeLimitedRewardCallback处理回合数限制、时间限制和检查点保存
+    # 注意：删除了CheckpointCallback，因为它的save_freq是按callback调用次数（在20个并行env下200000次≈400万timesteps，超过总步数200万）
+    # TimeLimitedRewardCallback已实现按model.num_timesteps的保存逻辑，更准确
     reward_cb = TimeLimitedRewardCallback(
         model=model,
         checkpoint_path=model_save_path,
         checkpoint_freq=PPO_CONFIG["checkpoint_freq"],
         max_episodes=PPO_CONFIG["max_episodes"],
         convergence_window=100,
-        convergence_threshold=0.01
+        convergence_threshold=0.01,
+        curriculum_start_max_agents=25,  # 初始最大agent数
+        curriculum_final_max_agents=100,  # 最终最大agent数（覆盖所有任务）
+        curriculum_timesteps=600000  # 课程学习爬坡周期（600k步内完成，剩余1.4M步全量训练）
     )
     
-    callbacks = CallbackList([checkpoint_cb, reward_cb])
+    callbacks = reward_cb  # 只使用TimeLimitedRewardCallback，它已经包含了检查点保存功能
     
     # 开始训练
     print("\n[步骤5] 开始训练...")
